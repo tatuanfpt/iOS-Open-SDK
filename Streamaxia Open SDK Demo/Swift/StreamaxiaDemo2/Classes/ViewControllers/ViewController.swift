@@ -8,10 +8,11 @@
 
 import UIKit
 import StreamaxiaSDK
+import AVFoundation
 
 // Modify this to your desired stream name
 // Playback will be available at play.streamaxia.com/<your-stream-name>
-let kStreamaxiaStreamName: String = "testy"
+let kStreamaxiaStreamName: String = "ryan"
 
 /// View controller that displays some basic UI for capturing and streaming
 /// live video and audio media.
@@ -38,13 +39,19 @@ class ViewController: UIViewController {
     @IBOutlet weak var overlayView: UIView!
     
     /// The recorder
-    fileprivate var recorder: AXRecorder!
+    fileprivate var streamer = AXStreamer()
+    fileprivate var streamSource = AXStreamSource()
+    fileprivate let avAudioEngine = AVAudioEngine()
+    var start: Double?
     
     /// The stream info
     fileprivate var streamInfo: AXStreamInfo!
     
     /// The recorder settings
     fileprivate var recorderSettings: AXRecorderSettings!
+    let sendImage = UIImage(named: "AppIcon")?.cvPixelBuffer(size: CGSize(width: 1280, height: 720))
+    var displayLink: CADisplayLink!
+
     
     // MARK: - View Lifecycle -
     
@@ -59,10 +66,6 @@ class ViewController: UIViewController {
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        
-        if self.recorder.isActive {
-            self.recorder.stopStreaming()
-        }
     }
     
     // MARK: - Public methods -
@@ -71,40 +74,27 @@ class ViewController: UIViewController {
     
     @IBAction func startButtonPressed(_ button: UIButton) {
         print("*** DEMO *** Recorder button pressed.")
-        
-        if (self.recorder == nil) {
-            print("*** DEMO *** The recorder was not properly initialized.")
-            
-            return;
-        }
+        setupStreaming()
+        setupAVAudioEngine()
         
         if (button.tag == self.kStartButtonTag) {
             print("*** DEMO *** START button pressed.")
             
-            self.checkOrientation()
-            
-            self.recorder.startStreaming(completion: { (success, error) in
-                print("*** DEMO *** The stream started with success: %@", success ? "YES" : "NO")
-                
-                if (success) {
-                    DispatchQueue.main.async {
-                        self.startButton.tag = self.kStopButtonTag
-                        self.startButton.setTitle("Stop", for: .normal)
-                    }
-                    
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
-                        self.takeSnapshot()
-                    }
-                } else {
-                    print("*** DEMO *** Error: %@", error ?? "")
-                }
-            })
+          streamer.startStreaming { (success, error) in
+            guard success else {
+              print("ryan fail", error)
+              return
+            }
+            self.streamSource.on = true
+            self.startDisplayLink()
+            self.startAudioEngine()
+          }
         } else if (button.tag == self.kStopButtonTag) {
             print("*** DEMO *** STOP button pressed.")
             
             self.startButton.tag = self.kStartButtonTag
             self.startButton.setTitle("Start", for: .normal)
-            self.recorder.stopStreaming()
+            self.streamer.stopStreaming()
             self.updateLabel(time: 0.0)
         }
     }
@@ -113,64 +103,78 @@ class ViewController: UIViewController {
 // MARK: - Private methods -
 
 fileprivate extension ViewController {
-    //#pragma mark - Private methods
+  
+  func setupAVAudioEngine() {
+      let session = AVAudioSession.sharedInstance()
+      do {
+        try session.setCategory(AVAudioSession.Category.playAndRecord, mode: AVAudioSession.Mode.voiceChat, options: [.allowBluetooth, .allowAirPlay, .mixWithOthers, .allowBluetoothA2DP, .defaultToSpeaker])
+        try session.setPreferredSampleRate(Double(48000))
+        try avAudioEngine.inputNode.setVoiceProcessingEnabled(true)
+        try avAudioEngine.outputNode.setVoiceProcessingEnabled(true)
+      } catch {
+        print("error with audio session")
+      }
     
-    fileprivate func takeSnapshot() {
-        recorder.takeSnapshot { (image, error) in
-            if let image = image {
-                print("Took a snapshot with:\(image.size)")
-                // do something with the snapshot
-            }
-        }
+    let audioFormat = avAudioEngine.inputNode.outputFormat(forBus: 0)
+    let mixer = AVAudioMixerNode()
+    avAudioEngine.attach(mixer)
+    avAudioEngine.connect(avAudioEngine.inputNode, to: mixer, format: audioFormat)
+    
+    let sinkNode = AVAudioSinkNode { (_, _, _) -> OSStatus in
+      return noErr
     }
     
-    fileprivate func defaultStreamInfo() -> AXStreamInfo {
+    avAudioEngine.attach(sinkNode)
+    avAudioEngine.connect(mixer, to: sinkNode, format: audioFormat)
+      
+      mixer.installTap(onBus: 0, bufferSize: 1024, format: audioFormat) { [weak self] (buffer, time) in
+        var data = Data()
+        let audioBufferList = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
+        for buffer in audioBufferList {
+          guard let bufferData = buffer.mData?.assumingMemoryBound(to: UInt8.self) else {
+            continue
+          }
+          data.append(bufferData, count: Int(buffer.mDataByteSize))
+        }
+        print("sending buffer")
+        
+        let timestamp: Double = Double(time.sampleTime) / time.sampleRate * 1000
+        
+        self?.streamer.sendAudioData(data, timestamp: UInt64(timestamp))
+      }
+    }
+  
+  func startAudioEngine() {
+    do {
+      avAudioEngine.prepare()
+      try avAudioEngine.start()
+    } catch _ {
+      print("error starting avaudioengine")
+    }
+  }
+  
+  func startDisplayLink() {
+    displayLink = CADisplayLink(target: self, selector: #selector(sendImageBuffer))
+    displayLink.add(to: .main, forMode: .default)
+    displayLink.preferredFramesPerSecond = 30
+  }
+    //#pragma mark - Private methods
+    
+  func defaultStreamInfo() -> AXStreamInfo {
         let info = AXStreamInfo.init()
         info.useSecureConnection = false
         
-        info.customStreamURLString = "rtmp://rtmp.streamaxia.com/streamaxia/\(kStreamaxiaStreamName)"
-        
-//    Alternatively you can split the URL into its corresponding RTMP parts
-//      info.serverAddress = "rtmp.streamaxia.com"
-//      info.applicationName = "streamaxia"
-//      info.streamName = kStreamaxiaStreamName;
-        
+        info.customStreamURLString = "rtmp://rtmp.streamaxia.com/streamaxia/\(kStreamaxiaStreamName)"// "rtmp://a.rtmp.youtube.com/live2/<youtube streamkey>"
+
         info.username = ""
         info.password = ""
         
         return info
     }
     
-    fileprivate func defaultRecorderSettings() -> AXRecorderSettings {
-        let utils = AXUtils.init()
-        let settings = AXRecorderSettings.init()
-        
-        settings.videoFrameResolution = .standard720p
-        settings.videoBitrate = utils.bitrate(for: settings.videoFrameResolution)
-        settings.keyFrameInterval = Int(0.5 * Double(settings.frameRate))
-        
-        return settings
-    }
     
-    
-    fileprivate func setupStreamaxiaSDK() {
+  func setupStreamaxiaSDK() {
         let sdk = AXStreamaxiaSDK.sharedInstance()!
-        
-        //        Load the configuration certificate from the main bundle, standard URL
-        
-        //        NOTE: the .config and .key must be added to the project, with the name unchanged
-        //        sdk.setupSDK(completion: { (success, error) in
-        //            print("*** Streamaxia SDK *** Setup was completed with success: %@ \n*** error: %@", success ? "YES" : "NO", error ?? "")
-        //
-        //            // Printing StreamaxiaSDK status
-        //            sdk.debugPrintStatus()
-        //
-        //            if (success) {
-        //                DispatchQueue.main.async {
-        //                    self.setupStreaming()
-        //                }
-        //            }
-        //        })
         
         // Alternatively, a custom bundle can be used to load the certificate:
         let bundleURL = Bundle.main.url(forResource: "demo-certificate", withExtension: "bundle")
@@ -186,53 +190,36 @@ fileprivate extension ViewController {
             }
         }
     }
+  
+  @objc func sendImageBuffer() {
+    let start = self.start ?? CACurrentMediaTime() * 1000
+    self.start = start
     
-    fileprivate func setupStreaming() {
-        self.streamInfo = self.defaultStreamInfo()
-        self.recorderSettings = self.defaultRecorderSettings()
-        
-        if let recorder = AXRecorder.init(streamInfo: self.streamInfo, settings: self.recorderSettings) {
-            recorder.recorderDelegate = self
-            recorder.setup(with: self.recorderView)
-            recorder.prepareToRecord()
-            
-            var error: AXError?
-            
-            // Enable adaptive bitrate
-            // Video quality will be adjusted based on available network and hardware resources
-            recorder.activateFeatureAdaptiveBitRateWithError(&error)
-            if error != nil {
-                print("*** ERROR activating feature adaptive bitrate: \(error!.message)")
-                error = nil
-            }
-            
-            // Enable local save
-            // The broadcast will be saved to the users camera roll when finished
-            recorder.activateFeatureSaveLocallyWithError(&error)
-            if error != nil {
-                print("*** ERROR activating feature save locally: \(error!.message)")
-            }
-            
-            // Enable tap to focus
-            // The focus and exposure will be adjusted based on your selection
-            recorder.activateFeatureTapToFocus { (success, error) in
-                guard success else {
-                    print("*** ERROR activating feature tap to focus: \(error!.message)")
-                    return
-                }
-            }
-            
-            self.recorder = recorder
-        }
-        
-        // Printing some debug info about the initialiation settings
-        let debugRecorderSettings = AXDebug.init().string(from: self.recorderSettings)
-        let debugStreamInfo = AXDebug.init().string(from: self.streamInfo)
-        
-        print("*** DEMO **** Did set up the recorder with the following settings:\n%@\n%@", debugRecorderSettings!, debugStreamInfo!)
+    let timestamp = CACurrentMediaTime() * 1000
+    guard let buffer = sendImage?.sampleBuffer(timestamp: timestamp - start) else {
+      return
+    }
+    print("sending image")
+    
+    streamer.sendVideoBuffer(buffer)
+  }
+    
+  func setupStreaming() {
+      self.streamInfo = self.defaultStreamInfo()
+      
+      streamer.videoSettings.setResolution(.size1280x720, withError: nil)
+      streamer.videoSettings.setSendingVideo(true, withError: nil)
+      
+      streamer.audioSettings.setChannelsNumber(2, withError: nil)
+      streamer.audioSettings.setSampleRate(UInt(48000), withError: nil)
+      streamer.audioSettings.setSendingAudio(true, withError: nil)
+      streamer.delegate = self
+
+      streamSource = streamer.addStreamSource(with: streamInfo)
+      streamSource.delegate = self
     }
     
-    fileprivate func updateLabel(time: TimeInterval) {
+  func updateLabel(time: TimeInterval) {
         let t = Int(time)
         let s = t % 60
         let m = (t / 60) % 60
@@ -244,88 +231,62 @@ fileprivate extension ViewController {
             self.rightLabel.text = text
         }
     }
-    
-    fileprivate func checkOrientation() {
-        let currentOrientation: UIInterfaceOrientation = UIApplication.shared.statusBarOrientation
-        var error: AXError? = nil
-        if currentOrientation == .portrait {
-            recorder.changeResolutionInversion(true, withError: &error)
-        } else if currentOrientation != .portraitUpsideDown {
-            recorder.changeResolutionInversion(false, withError: &error)
-        }
-        if error != nil {
-            // Handle error
-        }
-    }
 }
 
 // MARK: - AXRecorderDelegate -
 
-extension ViewController: AXRecorderDelegate {
-    func recorder(_ recorder: AXRecorder!, didChange state: AXRecorderState) {
-        print("*** DEMO *** Recorder State Changed to: \(state)")
-        
-        var string = "N/A"
-        
-        switch state {
-        case .stopped:
-            string = "[Stopped]"
-        case .recording:
-            string = "[Recording]"
-        case .starting:
-            string = "[Starting...]"
-        case .stopping:
-            string = "[Stopping...]"
-        case .collectingExtraData:
-            string = "[Get Extra Data]"
-        case .processingExtraData:
-            string = "[Proc. Extra Data]"
-        default:
-            string = "[Unknown state]"
-        }
-        
-        DispatchQueue.main.async {
-            self.leftLabel.text = string
-        }
+extension ViewController: AXStreamerDelegate {
+  func streamer(_ streamer: AXStreamer!, didChange state: AXStreamerState) {
+    print("*** DEMO *** Recorder State Changed to: \(state)")
+    
+    var string = "N/A"
+    
+    switch state {
+    case .stopped:
+      string = "[Stopped]"
+      string = "[Recording]"
+    case .starting:
+      string = "[Starting...]"
+    case .stopping:
+      string = "[Stopping...]"
+    case .streaming:
+      string = "[Streaming...]"
+    default:
+      string = "[Unknown state]"
     }
     
-    func recorder(_ recorder: AXRecorder!, didUpdateStreamTime deltaTime: TimeInterval) {
-        // Show the recording time in the right label
-        DispatchQueue.main.async {
-            self.updateLabel(time: deltaTime)
-        }
+    DispatchQueue.main.async {
+      self.leftLabel.text = string
     }
+  }
+  
+  func streamer(_ streamer: AXStreamer!, didReceive warning: AXWarning!) {
+    print("ryan warning")
     
-    func recorder(_ recorder: AXRecorder!, didChange status: AXNetworkStatus) {
-        print("*** DEMO *** did change network status: \(status)")
-        
-        var string = "Unknown network status"
-        
-        switch status {
-        case .notReachable:
-            string = "Lost internet connection"
-        case .reachableViaWiFi:
-            string = "Internet is reachable on wifi"
-        case .reachableViaWWAN:
-            string = "Internet is reachabale on Cellular"
-        }
-        
-        DispatchQueue.main.async {
-            self.infoLabel.text = string
-        }
-    }
-    
-    func recorder(_ recorder: AXRecorder!, didReceive info: AXInfo!) {
-        print("*** DEMO *** did receive info: %@", info)
-    }
-    
-    func recorder(_ recorder: AXRecorder!, didReceive warning: AXWarning!) {
-        print("*** DEMO *** did receive warning: %@", warning)
-    }
-    
-    func recorder(_ recorder: AXRecorder!, didReceiveError error: AXError!) {
-        print("*** DEMO *** did receive error: %@", error)
-    }
+  }
+  
+  func streamer(_ streamer: AXStreamer!, didReceiveError error: AXError!) {
+    print("ryan error")
+  }
+}
+
+extension ViewController: AXStreamSourceDelegate {
+  func streamSourceDidConnect(_ streamSource: AXStreamSource!) {
+    print("ryan did connect")
+  }
+  
+  func streamSourceDidCloseConnection(_ streamSource: AXStreamSource!) {
+    print("ryan did close")
+  }
+  
+  func streamSourceDidDisconnect(_ streamSource: AXStreamSource!) {
+    print("ryan did disc")
+  }
+  
+  func streamSource(_ streamSource: AXStreamSource!, didFailConnectingWithError error: AXError!) {
+    print("ryan did fail")
+  }
+  
 }
 
 // MARK: - UI Setup -
@@ -344,7 +305,7 @@ fileprivate extension ViewController {
         return UIFont.init(name: "AvenirNextCondensed-Medium", size: 20.0)
     }
     
-    fileprivate func setupUI() {
+  func setupUI() {
         self.setupMain()
         self.setupStartButton()
         self.setupLeftLabel()
@@ -395,4 +356,55 @@ fileprivate extension ViewController {
         label.text = ""
         label.textColor = UIColor.white
     }
+}
+
+
+extension UIImage {
+  func cvPixelBuffer(size: CGSize) -> CVPixelBuffer? {
+    let attrs = [kCVPixelBufferCGImageCompatibilityKey: kCFBooleanTrue, kCVPixelBufferCGBitmapContextCompatibilityKey: kCFBooleanTrue] as CFDictionary
+    var pixelBuffer : CVPixelBuffer?
+    let status = CVPixelBufferCreate(kCFAllocatorDefault, Int(size.width), Int(size.height), kCVPixelFormatType_32ARGB, attrs, &pixelBuffer)
+    guard (status == kCVReturnSuccess) else {
+      return nil
+    }
+
+    CVPixelBufferLockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
+    let pixelData = CVPixelBufferGetBaseAddress(pixelBuffer!)
+
+    let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
+    let context = CGContext(data: pixelData, width: Int(size.width), height: Int(size.height), bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixelBuffer!), space: rgbColorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue)
+
+    context?.translateBy(x: 0, y: size.height)
+    context?.scaleBy(x: 1.0, y: -1.0)
+
+    UIGraphicsPushContext(context!)
+    draw(in: CGRect(x: 0, y: 0, width: size.width, height: size.height))
+    UIGraphicsPopContext()
+    CVPixelBufferUnlockBaseAddress(pixelBuffer!, CVPixelBufferLockFlags(rawValue: 0))
+
+    return pixelBuffer
+  }
+}
+
+extension CVPixelBuffer {
+  func sampleBuffer(timestamp: Double) -> CMSampleBuffer? {
+    var newSampleBuffer: CMSampleBuffer? = nil
+    var timingInfo = CMSampleTimingInfo()
+    timingInfo.presentationTimeStamp = CMTime(value: Int64(timestamp), timescale: 1000)
+    timingInfo.duration = CMTime(seconds: 1, preferredTimescale: 30)
+    timingInfo.decodeTimeStamp = CMTime.invalid
+    var videoInfo: CMVideoFormatDescription? = nil
+    CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                                                 imageBuffer: self,
+                                                 formatDescriptionOut: &videoInfo)
+    CMSampleBufferCreateForImageBuffer(allocator: kCFAllocatorDefault,
+                                       imageBuffer: self,
+                                       dataReady: true,
+                                       makeDataReadyCallback: nil,
+                                       refcon: nil,
+                                       formatDescription: videoInfo!,
+                                       sampleTiming: &timingInfo,
+                                       sampleBufferOut: &newSampleBuffer)
+    return newSampleBuffer
+  }
 }
