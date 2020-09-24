@@ -125,24 +125,54 @@ fileprivate extension ViewController {
     }
     
     avAudioEngine.attach(sinkNode)
-    avAudioEngine.connect(mixer, to: sinkNode, format: audioFormat)
-      
-      mixer.installTap(onBus: 0, bufferSize: 1024, format: audioFormat) { [weak self] (buffer, time) in
-        var data = Data()
-        let audioBufferList = UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList)
-        for buffer in audioBufferList {
-          guard let bufferData = buffer.mData?.assumingMemoryBound(to: UInt8.self) else {
-            continue
-          }
-          data.append(bufferData, count: Int(buffer.mDataByteSize))
-        }
-        print("sending buffer")
-        
-        let timestamp: Double = Double(time.sampleTime) / time.sampleRate * 1000
-        
-        self?.streamer.sendAudioData(data, timestamp: UInt64(timestamp))
-      }
+    guard let outputFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
+                                           sampleRate: Double(48000),
+                                           channels: 2,
+                                           interleaved: true),
+          let converter = AVAudioConverter(from: audioFormat, to: outputFormat) else {
+      print("failed to make converter")
+      return
     }
+    converter.sampleRateConverterQuality = AVAudioQuality.max.rawValue
+    converter.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Normal
+    converter.primeMethod = .none
+    
+    avAudioEngine.connect(mixer, to: sinkNode, format: audioFormat)
+    
+    mixer.installTap(onBus: 0, bufferSize: 1024, format: audioFormat) { [weak self] (buffer, time) in
+      let newFrameCapacity = UInt32(outputFormat.sampleRate / audioFormat.sampleRate * Double(buffer.frameLength))
+      guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: newFrameCapacity) else {
+        print("failed to create buffer")
+        return
+      }
+      
+      outputBuffer.frameLength = outputBuffer.frameCapacity
+      var error: NSError?
+      let status = converter.convert(to: outputBuffer, error: &error) { (count, status) -> AVAudioBuffer? in
+        status.pointee = .haveData
+        return buffer
+      }
+      
+      guard status != AVAudioConverterOutputStatus.error else {
+        print("error converting")
+        return
+      }
+      
+      var data = Data()
+      let audioBufferList = UnsafeMutableAudioBufferListPointer(outputBuffer.mutableAudioBufferList)
+      for buffer in audioBufferList {
+        guard let bufferData = buffer.mData?.assumingMemoryBound(to: UInt8.self) else {
+          continue
+        }
+        data.append(bufferData, count: Int(buffer.mDataByteSize))
+      }
+      print("sending buffer")
+      
+      let timestamp: Double = Double(time.sampleTime) / time.sampleRate * 1000
+      
+      self?.streamer.sendAudioData(data, timestamp: UInt64(timestamp))
+    }
+  }
   
   func startAudioEngine() {
     do {
@@ -164,7 +194,7 @@ fileprivate extension ViewController {
         let info = AXStreamInfo.init()
         info.useSecureConnection = false
         
-        info.customStreamURLString = "rtmp://rtmp.streamaxia.com/streamaxia/\(kStreamaxiaStreamName)"// "rtmp://a.rtmp.youtube.com/live2/<youtube streamkey>"
+        info.customStreamURLString = "rtmp://a.rtmp.youtube.com/live2/<youtube stream key>"
 
         info.username = ""
         info.password = ""
