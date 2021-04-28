@@ -12,7 +12,7 @@ import AVFoundation
 
 // Modify this to your desired stream name
 // Playback will be available at play.streamaxia.com/<your-stream-name>
-let kStreamaxiaStreamName: String = "ryan"
+let kStreamaxiaStreamName: String = "botbh"
 
 /// View controller that displays some basic UI for capturing and streaming
 /// live video and audio media.
@@ -194,7 +194,7 @@ fileprivate extension ViewController {
         let info = AXStreamInfo.init()
         info.useSecureConnection = false
         
-        info.customStreamURLString = "rtmp://a.rtmp.youtube.com/live2/<youtube stream key>"
+        info.customStreamURLString = "http://play.streamaxia.com/botbh>"
 
         info.username = ""
         info.password = ""
